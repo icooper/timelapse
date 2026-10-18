@@ -1,0 +1,9 @@
+# Allowlist: keep multi-gigabyte videos out of the build context.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!src
+!tests
+**/__pycache__

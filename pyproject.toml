@@ -1,0 +1,42 @@
+[project]
+name = "timelapse"
+version = "0.1.0"
+description = "Turn long videos into time-lapses on Intel Arc GPUs with PyAV and VA-API"
+readme = "README.md"
+authors = [
+    { name = "Ian Cooper", email = "icooper@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    # PyAV must link against an FFmpeg with VA-API. Its PyPI wheels bundle an FFmpeg
+    # without it, so the container builds PyAV from source (--no-binary-package av).
+    # av 19 needs FFmpeg 9 and Ubuntu 26.04 ships FFmpeg 8.0, so av stays on 18.x.
+    "av==18.1.0",
+    "rich>=15.0.0",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+timelapse = "timelapse.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "numpy>=2.5.4",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs an Intel GPU and a VA-API-enabled PyAV (run inside the container)"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,28 @@
+# docker compose run --rm timelapse fixed_input.mp4 --speedup 300
+# docker compose run --rm test
+#
+# VIDEOS: folder mounted at /data (default: this folder).
+# RENDER_GID: host group that owns /dev/dri/renderD* (getent group render).
+x-gpu: &gpu
+  devices:
+    - /dev/dri:/dev/dri
+  group_add:
+    - ${RENDER_GID:-991}
+
+services:
+  timelapse:
+    <<: *gpu
+    build:
+      context: .
+      target: runtime
+    image: timelapse:latest
+    user: ${UID:-1000}:${GID:-1000}
+    volumes:
+      - ${VIDEOS:-.}:/data
+
+  test:
+    <<: *gpu
+    build:
+      context: .
+      target: test
+    image: timelapse:test
