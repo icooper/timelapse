@@ -1,8 +1,9 @@
 """Render one chunk: seek to each sample, decode on the GPU, encode on the GPU, write a segment.
 
-This runs in a worker process. Decoded frames stay in GPU memory: the encoder
-adopts the decoder's frames context with the first frame, so both codecs share
-one VA-API connection and no frame is copied to system memory.
+This runs in a worker process. Decoded frames stay in GPU memory, and so do
+frames resized by scale_vaapi: the encoder adopts the frames context of the
+first frame it gets, so everything shares the decoder's VA-API connection and no
+frame is copied to system memory.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from av.video.frame import PictureType
 
 from timelapse.gpu import ENCODERS
 from timelapse.sampling import Chunk, prefer_earlier
+from timelapse.scale import GpuScaler, Size
 
 
 class ProgressSink(Protocol):
@@ -33,6 +35,7 @@ class ChunkJob:
     source: Path
     segment: Path
     fps: Fraction
+    size: Size  # output size; frames are resized on the GPU if it differs from the source's
     codec: str
     quality: int
     keyframes_only: bool
@@ -138,8 +141,9 @@ def render_chunk(job: ChunkJob, progress: ProgressSink | None = None) -> ChunkRe
             hwaccel=HWAccel("vaapi", job.device),
             options={"rc_mode": "CQP", "global_quality": str(job.quality)},
         )
-        encoder.width = stream.codec_context.width
-        encoder.height = stream.codec_context.height
+        source_size = Size(stream.codec_context.width, stream.codec_context.height)
+        scaler = GpuScaler(job.size) if job.size != source_size else None
+        encoder.width, encoder.height = job.size.width, job.size.height
         # The input frames are GPU surfaces. With pix_fmt "vaapi" the encoder
         # adopts their frames context instead of uploading from system memory.
         encoder.pix_fmt = "vaapi"
@@ -162,6 +166,8 @@ def render_chunk(job: ChunkJob, progress: ProgressSink | None = None) -> ChunkRe
         picker = FramePicker(source, stream, keyframes_only=job.keyframes_only, seek_ahead=job.seek_ahead)
         for n, t in enumerate(job.chunk.targets):
             frame = picker.pick(t)
+            if scaler is not None:
+                frame = scaler(frame)
             frame.pts, frame.time_base, frame.duration = n, frame_time, 1
             # Decoded keyframes keep pict_type I, which encoders treat as a forced
             # keyframe; left alone, every output frame would be an IDR frame.

@@ -3,10 +3,13 @@
 from fractions import Fraction
 
 import av
+import av.codec.hwaccel
 import pytest
 from videos import decode_indices, make_video
 
 from timelapse.pipeline import Settings, make_plan, run_plan
+from timelapse.scale import GpuScaler, Size
+from timelapse.worker import FramePicker
 
 pytestmark = pytest.mark.gpu
 FPS = 20
@@ -78,6 +81,48 @@ def test_output_is_tagged_hevc_at_output_rate(videos, tmp_path, gpu_device):
         assert stream.average_rate == FPS
         assert stream.frames == 12
         assert float(container.duration / av.time_base) == pytest.approx(12 / FPS)
+
+
+@pytest.mark.parametrize(
+    "video,mode,expected",
+    [
+        ("gop20", "keyframes", [100 * k for k in range(12)]),
+        ("gop35", "keyframes", [nearest_multiple(100 * k, 35) for k in range(12)]),
+        ("gop35", "exact", [100 * k for k in range(12)]),
+    ],
+)
+def test_scale_resizes_on_the_gpu(videos, tmp_path, gpu_device, video, mode, expected):
+    plan, _, output = render(
+        videos[video], tmp_path, gpu_device, speedup=100, mode=mode, scale=Size(320, -1), jobs_per_gpu=2
+    )
+    assert plan.size == Size(320, 180)
+    with av.open(str(output)) as container:
+        context = container.streams.video[0].codec_context
+        assert (context.width, context.height) == (320, 180)
+    assert decode_indices(output) == expected
+
+
+def test_scaler_keeps_its_graph_across_seeks(videos, gpu_device):
+    # The decoder makes a new pool of GPU frames after every seek; rebuilding the
+    # filter graph for each one cost about 4 ms per frame.
+    scaler = GpuScaler(Size(320, 180))
+    decoder = av.codec.hwaccel.HWAccel("vaapi", gpu_device, allow_software_fallback=False, is_hw_owned=True)
+    with av.open(str(videos["gop20"]), hwaccel=decoder) as container:
+        picker = FramePicker(container, container.streams.video[0], keyframes_only=True, seek_ahead=2)
+        scaler(picker.pick(5))
+        graph = scaler._graph
+        for t in (20, 40, 10):
+            frame = scaler(picker.pick(t))
+            assert (frame.width, frame.height) == (320, 180)
+            assert scaler._graph is graph
+
+
+def test_scale_can_stretch(videos, tmp_path, gpu_device):
+    _, _, output = render(videos["gop20"], tmp_path, gpu_device, speedup=100, scale=Size(480, 480))
+    with av.open(str(output)) as container:
+        context = container.streams.video[0].codec_context
+        assert (context.width, context.height) == (480, 480)
+    assert decode_indices(output) == [100 * k for k in range(12)]
 
 
 @pytest.mark.parametrize("codec", ["h264", "av1"])

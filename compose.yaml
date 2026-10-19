@@ -1,4 +1,4 @@
-# docker compose run --rm timelapse fixed_input.mp4 --speedup 300
+# docker compose run --rm timelapse video.mp4 --speedup 300 --scale 1920x1080
 # docker compose run --rm test
 #
 # VIDEOS: folder mounted at /data (default: this folder).

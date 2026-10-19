@@ -1,8 +1,8 @@
 # timelapse
 
-Turn long videos into time-lapses on Intel Arc GPUs. A 3.6-hour 4K recording becomes a 300x time-lapse in about 2 seconds on two Arc Pro B70s.
+Turn long videos into time-lapses on Intel Arc GPUs. A 24-hour 4K recording becomes a 300x time-lapse in about 11 seconds on two Arc Pro B70s, or about 9 seconds when scaled to 1080p.
 
-For each output frame, it seeks to the right point in the source and decodes only the frames it needs on the GPU. Each frame goes straight to the GPU encoder without leaving GPU memory. The timeline is split into chunks that run in parallel across all Intel GPUs, and the chunks are then joined without re-encoding.
+For each output frame, it seeks to the right point in the source and decodes only the frames it needs on the GPU. Each frame goes straight to the GPU encoder without leaving GPU memory, and it can be resized on the GPU on the way. The timeline is split into chunks that run in parallel across all Intel GPUs, and the chunks are then joined without re-encoding.
 
 ## Usage
 
@@ -10,9 +10,10 @@ Everything runs in a container, which provides an FFmpeg with VA-API and Intel's
 
 ```bash
 docker compose build timelapse
-docker compose run --rm timelapse fixed_input.mp4                 # → fixed_input_300x.mp4
+docker compose run --rm timelapse video.mp4                       # → video_300x.mp4
 docker compose run --rm timelapse a.mp4 b.mp4 --speedup 600       # several inputs
 docker compose run --rm timelapse clip.mp4 --speedup 60 --fps 30 -o clip_60x.mp4
+docker compose run --rm timelapse video.mp4 --scale 1920x1080     # 4K in, 1080p out
 docker compose run --rm timelapse clip.mp4 --dry-run              # show the plan only
 ```
 
@@ -20,8 +21,9 @@ By default the current folder is mounted at `/data`. Set `VIDEOS=/path/to/videos
 
 | Option | Default | |
 |---|---|---|
-| `--speedup` | 300 | How many times faster than real time the output plays |
+| `--speedup` | 300 | How many times faster than real time the output plays. A whole number, at least 2 |
 | `--fps` | input's rate | Output frame rate. It doesn't change the speedup, only the smoothness |
+| `--scale` | input's size | Output size as `WxH`, resized on the GPU. `-1` on one side keeps the aspect ratio, e.g. `1920x-1`. See [Scaling](#scaling) |
 | `--codec` | `hevc` | `hevc` (tagged `hvc1` for Apple players), `h264` or `av1` |
 | `--quality` | 22 / 20 / 90 | CQP quality for hevc / h264 / av1; lower is better |
 | `--exact` / `--keyframes` | auto | How frames are picked; see below |
@@ -36,12 +38,31 @@ One output frame covers `speedup / fps` seconds of source. For example, 300x at 
 - **Nearest keyframe**: seeks and decodes a single keyframe per output frame, so it's the fastest. It's used when keyframes are close together compared with the step, or when the step is a whole number of keyframe intervals. With 1 s keyframes, any multiple of 20x at 20 fps qualifies.
 - **Exact**: decodes forward from the keyframe before each point to the nearest frame. That's up to one GOP of extra decoding per output frame, with perfectly even timing. It's used otherwise, or with `--exact`.
 
-Times on a 3.6 h 4K H.264 file with 1 s keyframes, at 300x on two B70s:
+Times on a 24 h 4K H.264 recording (16.67 fps, keyframes every 1.2 s, 40 GB) at 300x on two B70s. That's 4,798 output frames, or 4.8 minutes:
 
-| Mode | Time | Frames decoded |
-|---|---|---|
-| nearest keyframe | 2.2 s | 869 |
-| exact | 8.9 s | 10,417 |
+| Mode | 4K | `--scale 1920x1080` | Frames decoded |
+|---|---|---|---|
+| nearest keyframe | 10.7–11.2 s (1,464 MiB) | 9.4 s (595 MiB) | 4,798 |
+| exact | 44.8 s (1,640 MiB) | 39.8 s (490 MiB) | 52,256 |
+
+Scaled runs are faster because encoding 1080p frames is much cheaper than encoding 4K ones.
+
+## Scaling
+
+`--scale WxH` resizes each output frame with FFmpeg's `scale_vaapi` filter. Frames go from the decoder through the scaler to the encoder without leaving GPU memory. Scaling takes about 0.1 ms per frame, and the smaller encode more than makes up for it. Only the output frames are scaled, not every frame decoded on the way to them. With `-1` on one side, that side is computed from the input's aspect ratio, so `--scale 1920x-1` gives 1920x1080 for 16:9 input and 1920x1440 for 4:3.
+
+On the B70, `scale_vaapi`'s `default`, `fast` and `hq` modes produce identical output. Scaling 4K camera frames to 1080p measured 43.2 dB PSNR against a software Lanczos scale, better than software bilinear (38.4 dB).
+
+Limitations:
+
+- **Exact size, no cropping or padding.** If `WxH` has a different aspect ratio from the input, the picture is stretched. The plan prints a warning when that happens. Use `-1` on one side to avoid it.
+- **Upscales too.** Inputs smaller than `WxH` are scaled up. Inputs already at that size pass through unscaled.
+- **One size per run.** With several inputs, each is scaled to the same `WxH`. A `-1` side is computed separately for each input.
+- **Even sizes only.** 4:2:0 video needs even dimensions, so odd values are rejected. A side computed from `-1` is rounded to the nearest even number, which can be a pixel off the exact aspect ratio.
+- **Stored pixels.** Sizes and aspect ratios use the frame's stored width and height. Rotation metadata and non-square pixels are ignored.
+- **No color conversion.** The output keeps the input's pixel format and color tags, with no HDR tone mapping. It has been tested with 8-bit 4:2:0 H.264 input only.
+- **No choice of algorithm.** The driver's scaler is the only one, A CPU scaler would cost about 10 ms per frame: 6.5 ms to copy each 4K frame out of GPU memory, plus 3–4.4 ms to scale it.
+- **Tied to PyAV 18.1 and FFmpeg 8.** PyAV can't pass a GPU frames context to a filter graph, so `scale.py` makes that one libavfilter call through ctypes, using struct offsets pinned for these versions. With any other version, `--scale` refuses to run instead of guessing. After upgrading either, check the offsets: `tests/test_scale.py` checks the ones it can on the host, and the GPU tests cover the rest.
 
 ## Development
 
@@ -49,6 +70,7 @@ Times on a 3.6 h 4K H.264 file with 1 s keyframes, at 300x on two B70s:
 uv sync                                   # host: PyAV's PyPI wheel, enough for unit tests
 uv run pytest                             # GPU tests are skipped on the host
 uv run ruff check && uv run ruff format
+docker compose build test timelapse       # rebuild after every change; the images contain the code
 docker compose run --rm test              # everything, including GPU end-to-end tests
 ```
 
@@ -57,7 +79,7 @@ The GPU tests render synthetic videos whose frames have their frame number paint
 ### Why a container, and why `av==18.1.0`
 
 - **PyAV's PyPI wheels can't use these GPUs.** They bundle an FFmpeg built without VA-API, and on Linux FFmpeg's QSV support needs VA-API too. So the image compiles PyAV from source against Ubuntu 26.04's FFmpeg (`--no-binary-package av`).
-- **PyAV 19 requires FFmpeg 9**, while Ubuntu 26.04 ships FFmpeg 8.0, hence the pin. Move to av 19+ when the base image has FFmpeg 9.
+- **PyAV 19 requires FFmpeg 9**, while Ubuntu 26.04 ships FFmpeg 8.0, hence the pin. Move to av 19+ when the base image has FFmpeg 9, and re-check `scale.py`'s pinned offsets when you do (see [Scaling](#scaling)).
 
 ### Layout
 
@@ -65,7 +87,8 @@ The GPU tests render synthetic videos whose frames have their frame number paint
 |---|---|
 | `cli.py` | Typer CLI and Rich progress |
 | `pipeline.py` | Planning; runs chunks in a process pool |
-| `worker.py` | Per-chunk seek, GPU decode, GPU encode, writing an MP4 segment |
+| `worker.py` | Per-chunk seek, GPU decode, GPU scale, GPU encode, writing an MP4 segment |
+| `scale.py` | `scale_vaapi` filter graphs for GPU frames, and the output-size math |
 | `concat.py` | Joins segments into the final MP4 |
 | `probe.py` | Video info and keyframe spacing (demuxing only) |
 | `sampling.py` | Pure logic: sample grid, chunks, mode choice |

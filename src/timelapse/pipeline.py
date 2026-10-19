@@ -23,6 +23,7 @@ from timelapse.sampling import (
     sample_interval,
     sample_times,
 )
+from timelapse.scale import Size, scaled_size
 from timelapse.worker import ChunkJob, ChunkResult, render_chunk
 
 # CQP quality per codec. av1_vaapi uses the 0-255 q_idx scale; 90 lands close
@@ -33,8 +34,9 @@ MODES = ("auto", "keyframes", "exact")
 
 @dataclass(frozen=True)
 class Settings:
-    speedup: float = 300.0
+    speedup: int = 300
     fps: Fraction | None = None  # None means the input's frame rate
+    scale: Size | None = None  # None keeps the input's size; -1 on one side keeps its aspect ratio
     codec: str = "hevc"
     quality: int | None = None
     jobs_per_gpu: int = 2
@@ -50,6 +52,7 @@ class Plan:
     info: VideoInfo
     keyframes: KeyframeStats
     fps: Fraction
+    size: Size
     step: Fraction
     keyframes_only: bool
     codec: str
@@ -75,6 +78,8 @@ def make_plan(source: Path, output: Path, settings: Settings, devices: list[str]
     if not 0 <= settings.start < end:
         raise TimelapseError(f"invalid range {settings.start:g}-{end:g}s (duration {info.duration:.1f}s)")
     fps = settings.fps or info.frame_rate
+    source_size = Size(info.width, info.height)
+    size = scaled_size(settings.scale, source_size) if settings.scale else source_size
     step = sample_interval(settings.speedup, fps)
     kf = keyframe_stats(source, info)
     if settings.mode == "auto":
@@ -88,6 +93,7 @@ def make_plan(source: Path, output: Path, settings: Settings, devices: list[str]
         info=info,
         keyframes=kf,
         fps=fps,
+        size=size,
         step=step,
         keyframes_only=keyframes_only,
         codec=settings.codec,
@@ -117,6 +123,7 @@ def run_plan(
                 source=plan.source.resolve(),
                 segment=Path(tmp) / f"seg_{chunk.index:03d}.mp4",
                 fps=plan.fps,
+                size=plan.size,
                 codec=plan.codec,
                 quality=plan.quality,
                 keyframes_only=plan.keyframes_only,

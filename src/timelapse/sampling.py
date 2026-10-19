@@ -33,9 +33,9 @@ class Chunk:
         return len(self.targets)
 
 
-def sample_interval(speedup: float, fps: Fraction) -> Fraction:
+def sample_interval(speedup: int, fps: Fraction) -> Fraction:
     """Seconds of source per output frame, kept exact so the sample grid doesn't drift."""
-    return Fraction(speedup).limit_denominator(1000) / Fraction(fps)
+    return speedup / Fraction(fps)
 
 
 def sample_times(start: float, end: float, step: Fraction) -> list[float]:

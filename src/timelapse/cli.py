@@ -24,6 +24,7 @@ from rich.text import Text
 from timelapse.errors import TimelapseError
 from timelapse.gpu import ENCODERS, check_device, discover_intel_gpus
 from timelapse.pipeline import Plan, Settings, make_plan, run_plan
+from timelapse.scale import Size, unsupported_reason
 
 console = Console(stderr=True, highlight=False)
 app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
@@ -45,8 +46,18 @@ def parse_rate(text: str) -> Fraction:
     return rate
 
 
-def default_output(source: Path, speedup: float) -> Path:
-    return source.with_name(f"{source.stem}_{speedup:g}x.mp4")
+def parse_size(text: str) -> Size:
+    try:
+        width, height = (int(side) for side in text.lower().split("x"))
+    except ValueError:
+        raise typer.BadParameter(f"invalid size {text!r}; expected WxH, such as 1920x1080") from None
+    if (width, height) == (-1, -1) or any(side != -1 and (side <= 0 or side % 2) for side in (width, height)):
+        raise typer.BadParameter("width and height must be positive even numbers, or -1 for one of them")
+    return Size(width, height)
+
+
+def default_output(source: Path, speedup: int) -> Path:
+    return source.with_name(f"{source.stem}_{speedup}x.mp4")
 
 
 class RateColumn(ProgressColumn):
@@ -64,6 +75,10 @@ def describe(plan: Plan) -> None:
     )
     if info.avg_fps and step * info.avg_fps < 1:
         console.print("⚠️  sampling faster than the source frame rate, so frames will repeat")
+    if plan.size != Size(info.width, info.height):
+        console.print(f"📐 scaling {info.width}x{info.height} → {plan.size} on the GPU")
+        if abs(plan.size.width * info.height / (plan.size.height * info.width) - 1) > 0.01:
+            console.print("⚠️  that changes the aspect ratio; use -1 for one side to keep it, e.g. 1920x-1")
     if kf.worst == float("inf"):
         kf_text = "keyframes too sparse to measure"
     else:
@@ -133,10 +148,18 @@ def timelapse(
     output: Annotated[
         Path | None, typer.Option("--output", "-o", help="Output file (default: <input>_<speedup>x.mp4).")
     ] = None,
-    speedup: Annotated[float, typer.Option(min=0.001, help="How many times faster than real time.")] = 300.0,
+    speedup: Annotated[int, typer.Option(min=2, help="How many times faster than real time.")] = 300,
     fps: Annotated[
         Fraction | None,
         typer.Option(parser=parse_rate, metavar="RATE", help="Output frame rate (default: the input's)."),
+    ] = None,
+    scale: Annotated[
+        Size | None,
+        typer.Option(
+            parser=parse_size,
+            metavar="WxH",
+            help="Resize on the GPU, e.g. 1920x1080. -1 on one side keeps the aspect ratio (1920x-1).",
+        ),
     ] = None,
     codec: Annotated[Codec, typer.Option(help="Output codec.")] = Codec.hevc,
     quality: Annotated[
@@ -163,6 +186,7 @@ def timelapse(
     settings = Settings(
         speedup=speedup,
         fps=fps,
+        scale=scale,
         codec=codec.value,
         quality=quality,
         jobs_per_gpu=jobs_per_gpu,
@@ -178,6 +202,8 @@ def timelapse(
             for d in devices:
                 if error := check_device(d, ENCODERS[settings.codec]):
                     raise TimelapseError(f"{d} can't encode with {ENCODERS[settings.codec]}: {error}")
+            if scale and (reason := unsupported_reason()):
+                raise TimelapseError(f"--scale: {reason}")
         for source in inputs:
             plan = make_plan(source, output or default_output(source, speedup), settings, devices)
             describe(plan)
