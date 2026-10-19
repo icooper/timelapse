@@ -28,14 +28,15 @@ def read_index(frame: av.VideoFrame) -> int:
     return hi * BASE + lo
 
 
-def make_video(path: Path, *, seconds: float, fps: int = 20, gop: int = 20) -> Path:
-    """H.264 with a keyframe exactly every `gop` frames (and B-frames, like camera footage)."""
+def make_video(path: Path, *, seconds: float, fps: int = 20, gop: int = 20, bframes: bool = True) -> Path:
+    """H.264 with a keyframe exactly every `gop` frames.
+
+    Some cameras use B-frames, so the decoder holds frames back for reordering.
+    Others, like the ones benchmarked in the README, don't.
+    """
+    params = f"keyint={gop}:min-keyint={gop}:scenecut=0" + ("" if bframes else ":bframes=0")
     with av.open(str(path), "w") as out:
-        stream = out.add_stream(
-            "libx264",
-            rate=fps,
-            options={"preset": "veryfast", "x264-params": f"keyint={gop}:min-keyint={gop}:scenecut=0"},
-        )
+        stream = out.add_stream("libx264", rate=fps, options={"preset": "veryfast", "x264-params": params})
         stream.width, stream.height, stream.pix_fmt = WIDTH, HEIGHT, "yuv420p"
         for i in range(round(seconds * fps)):
             frame = av.VideoFrame.from_ndarray(paint(i), format="yuv420p")

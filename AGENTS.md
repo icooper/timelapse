@@ -49,10 +49,11 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
   - A 4K output is about 1.5 GB. Write outputs to a temp dir and delete them afterwards.
 - **Do a warm-up run first**, then run each configuration 2–3 times.
 - **Current numbers** are in README.md's table under "How frames are picked":
-  - Nearest keyframe: about 11 s at 4K, 9.4 s with `--scale 1920x1080`.
-  - Exact: 44.8 s at 4K, 39.8 s at 1080p.
+  - Nearest keyframe: 10.7 s at 4K (encode-bound), 5.2–5.3 s with `--scale 1920x1080`.
+  - Exact: 42.2 s at 4K, 36.6 s at 1080p.
 - **Update that table** whenever performance changes.
 - **Per-stage timing:** wrap `FramePicker.pick` and `GpuScaler.__call__` in a script that calls `render_chunk` directly.
+- **Comparing implementations:** the CLI's 🎉 line times the render. Hash the outputs too. The decoder changes so far left them byte-identical.
 
 ## Invariants and gotchas
 
@@ -62,10 +63,15 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
   - The encoder gets `pix_fmt = "vaapi"` and its own `HWAccel`, then adopts the first frame's frames context.
   - Keep `reformat()` and `to_ndarray()` out of the hot path. Copying one 4K frame out of the GPU costs about 6.5 ms.
 - **Set `frame.pict_type = PictureType.NONE` before encoding.** Decoded keyframes keep type I, which forces IDR frames. Without the reset, every output frame was an I-frame and the file was 1.7x larger.
-- **The decoder makes a new frames context (pool of GPU frames) after every seek.** This happens with both cameras.
+- **A flushed H.264 decoder makes a new frames context (pool of GPU frames).** FFmpeg rebuilds the hwaccel on the next frame, at about 4.5 ms per 4K seek.
+  - `container.seek()` flushes every stream's own decoder. So the worker decodes with its own `Decoder`, which seeks don't touch.
+  - `Decoder` flushes only after draining, or before going back to a packet it has already decoded. It drops frames held from before a seek.
+- **Streams with B-frames** hold an isolated keyframe back for reordering, and `low_delay` doesn't help.
+  - Keyframe mode drains them with `decode(None)`, so the next pick flushes, and their pools still change with every pick. Drained frames have no `time_base`.
+  - The cameras have no B-frames. The synthetic test videos have them, except `gop35_ipp`.
+- **Frames contexts:**
   - Never key a cache on a frames-context pointer. `GpuScaler` used to, and rebuilt its graph for every frame, at about 4 ms each.
-  - When counting pools, keep the frames alive, or freed addresses get reused and you undercount.
-- **`seek()` flushes the decoder.** Keyframe mode drains it with `decode(None)` to get the frame out. Drained frames have no `time_base`.
+  - When counting pools, keep the frames alive, or freed addresses get reused and you undercount. Compare the `AVHWFramesContext` address, as `frames_context()` in the GPU tests does. The frame's `hw_frames_ctx` reference differs for every frame.
 - **`hevc_vaapi` uses B-frames**, so pts ≠ dts. The worker checks that timestamps stay valid.
   - Segments must be MP4: NUT loses dts on demux.
   - `concat` needs `add_stream_from_template(stream, opaque=True)`. Without `opaque`, PyAV looks up an encoder by the decoder's name, such as `libdav1d`, and fails.
@@ -94,6 +100,15 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
 - **User decisions, don't change:**
   - `--exact` stays opt-in.
   - `--scale` stays an exact `WxH`: it upscales, and it stretches with a warning.
+  - `--jobs-per-gpu` stays 2 by default. A sweep on `basement.mp4` after the `Decoder` change gave these times:
+
+    | Jobs per GPU | Keyframes, 4K | Keyframes, 1080p | Exact, 4K | Exact, 1080p |
+    |---|---|---|---|---|
+    | 1 | 16.2 s | 9.1 s | 64.0 s | 64.2 s |
+    | 2 | 10.8 s | 5.3 s | 42.1 s | 36.6 s |
+    | 3 | 10.7 s | 4.8 s | 44.3 s | 38.6 s |
+    | 4 | 10.7 s | 4.8 s | 48.8 s | 42.8 s |
+    | 6 | 10.7 s | 4.8 s | 44.4 s | 38.5 s |
 
 **Build**
 - **Keep `--reinstall-package timelapse` in the Dockerfile.** uv decides whether to rebuild the project from `pyproject.toml`'s mtime, so without it the cache mount can serve a stale wheel. This once made the tests run old code.
@@ -103,6 +118,7 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
 
 - **`tests/videos.py`** paints each frame's index into its luma. `decode_indices()` reads the indices back, so tests check exactly which source frame was picked.
   - AV1 outputs need `decode_indices(path, gpu_device)`.
+  - `make_video(..., bframes=False)` gives a stream like the cameras', which takes `Decoder`'s no-flush path. The B-frame videos cover draining and the flushes.
 - **GPU tests** are marked `gpu`. The `gpu_device` fixture skips them unless VA-API encoding works.
   - Any change to `worker.py`, `scale.py` or `concat.py` needs a GPU test.
   - Pure logic gets a host test.
@@ -123,5 +139,4 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
 
 ## Known opportunities
 
-- **The decoder reinitializes after every seek.** Draining isn't the cause. Picking one keyframe takes about 3 ms in total (seek, demux, decode), and the reinit's share of that hasn't been measured. If it's large, avoiding it would speed up every mode, but it's FFmpeg-internal.
 - **Moving to PyAV 19+ and FFmpeg 9:** wait until the base image ships FFmpeg 9, then redo `scale.py`'s offsets. Check upstream too: PyAV main's `Graph` now accepts a `hw_device`, and it may grow buffer-source frames-context support, which would replace the ctypes bridge.

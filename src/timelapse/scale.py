@@ -84,10 +84,10 @@ class GpuScaler:
 
     def __call__(self, frame: av.VideoFrame) -> av.VideoFrame:
         frames_ref, sw_format = _frames_context(frame)
-        # When the decoder reinitializes, it replaces its pool of GPU frames. With
-        # some cameras that happens after every seek. A graph can take surfaces
-        # from any pool on the same device, so it's only rebuilt when the
-        # frames' format or size changes.
+        # When the decoder is flushed, it replaces its pool of GPU frames. With
+        # B-frames, keyframe mode flushes it for every pick. A graph can take
+        # surfaces from any pool on the same device, so it's only rebuilt when
+        # the frames' format or size changes.
         if self._graph is None or self._input != (sw_format, frame.width, frame.height):
             self._graph = self._build(frame, frames_ref)
             self._input = (sw_format, frame.width, frame.height)

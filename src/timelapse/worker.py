@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Protocol
 
 import av
+from av.codec.context import CodecContext
 from av.codec.hwaccel import HWAccel
 from av.video.frame import PictureType
 
@@ -52,12 +53,57 @@ class ChunkResult:
     seconds: float
 
 
+class Decoder:
+    """Decodes a stream on the GPU, without the reinitialization a flush causes.
+
+    container.seek() flushes the stream's own decoder, and after a flush FFmpeg's
+    H.264 decoder rebuilds its hwaccel, with a new pool of GPU frames. At 4K that
+    cost about 4.5 ms per seek. Seeks don't touch this decoder, so it's flushed
+    only when it has to be: after draining, or before going back to a packet it
+    has already decoded.
+    """
+
+    def __init__(self, stream, device: str):
+        hwaccel = HWAccel("vaapi", device, allow_software_fallback=False, is_hw_owned=True)
+        self.context = CodecContext.create(stream.codec_context.codec, "r", hwaccel=hwaccel)
+        # Unlike av.open(), CodecContext.create() falls back to software silently.
+        if not self.context.is_hwaccel:
+            raise RuntimeError(f"{stream.codec_context.name} can't be decoded on {device}")
+        self.context.extradata = stream.codec_context.extradata
+        self.flushes = 0
+        self._start: int | None = None  # pts of the first packet since the last seek
+        self._last: int | None = None  # highest pts decoded since the last flush
+        self._drained = False
+
+    def seek(self) -> None:
+        """Call after seeking the container: the next packet starts a new run of frames."""
+        self._start = None
+
+    def decode(self, packet: av.Packet | None) -> list[av.VideoFrame]:
+        """Frames from `packet`; None, or the empty packet that ends a demux, drains the decoder."""
+        if packet is None or packet.pts is None:
+            self._drained = True
+        else:
+            if self._start is None:
+                if self._drained or (self._last is not None and packet.pts <= self._last):
+                    self.context.flush_buffers()
+                    self.flushes += 1
+                    self._drained, self._last = False, None
+                self._start = packet.pts
+            self._last = packet.pts if self._last is None else max(self._last, packet.pts)
+        frames = self.context.decode(packet)
+        # Frames still held for reordering from before a seek. Seeks that don't
+        # flush go forward, so all of them come before the new run.
+        return [f for f in frames if self._start is None or f.pts >= self._start]
+
+
 class FramePicker:
     """Returns the frame nearest each requested source time; times must increase."""
 
-    def __init__(self, container, stream, *, keyframes_only: bool, seek_ahead: float):
+    def __init__(self, container, stream, decoder: Decoder, *, keyframes_only: bool, seek_ahead: float):
         self.container = container
         self.stream = stream
+        self.decoder = decoder
         self.keyframes_only = keyframes_only
         self.seek_ahead = seek_ahead
         self.decoded = 0
@@ -68,8 +114,8 @@ class FramePicker:
         return self._nearest_keyframe(t) if self.keyframes_only else self._nearest_frame(t)
 
     def _seek(self, t: float) -> None:
-        # Seeking also flushes the decoder.
         self.container.seek(max(0, int(t / self.stream.time_base)), stream=self.stream, backward=True)
+        self.decoder.seek()
 
     def _time(self, pts: int) -> float:
         return float(pts * self.stream.time_base)
@@ -96,16 +142,16 @@ class FramePicker:
         )
         if chosen is None:
             raise RuntimeError(f"no keyframe found near {t:.3f}s")
-        # Draining returns the frame even if the decoder would otherwise hold it
-        # back for reordering. The next seek resets the decoder.
-        frames = chosen.decode() + self.stream.codec_context.decode(None)
+        # Streams with B-frames hold the keyframe back for reordering. Draining
+        # returns it, at the cost of a flush before the next pick.
+        frames = self.decoder.decode(chosen) or self.decoder.decode(None)
         self.decoded += 1
         return frames[0]
 
     def _decode_from(self, t: float) -> Iterator[av.VideoFrame]:
         self._seek(t)
-        for packet in self.container.demux(self.stream):  # the final empty packet flushes the decoder
-            for frame in packet.decode():
+        for packet in self.container.demux(self.stream):  # the final empty packet drains the decoder
+            for frame in self.decoder.decode(packet):
                 self.decoded += 1
                 yield frame
 
@@ -129,9 +175,8 @@ class FramePicker:
 
 def render_chunk(job: ChunkJob, progress: ProgressSink | None = None) -> ChunkResult:
     started = time.perf_counter()
-    decoder = HWAccel("vaapi", job.device, allow_software_fallback=False, is_hw_owned=True)
     with (
-        av.open(str(job.source), hwaccel=decoder) as source,
+        av.open(str(job.source)) as source,
         av.open(str(job.segment), "w", format="mp4") as segment,
     ):
         stream = source.streams.video[0]
@@ -163,7 +208,13 @@ def render_chunk(job: ChunkJob, progress: ProgressSink | None = None) -> ChunkRe
                 segment.mux(packet)
                 written += 1
 
-        picker = FramePicker(source, stream, keyframes_only=job.keyframes_only, seek_ahead=job.seek_ahead)
+        picker = FramePicker(
+            source,
+            stream,
+            Decoder(stream, job.device),
+            keyframes_only=job.keyframes_only,
+            seek_ahead=job.seek_ahead,
+        )
         for n, t in enumerate(job.chunk.targets):
             frame = picker.pick(t)
             if scaler is not None:

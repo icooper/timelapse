@@ -42,10 +42,10 @@ Times on a 24 h 4K H.264 recording (16.67 fps, keyframes every 1.2 s, 40 GB) at 
 
 | Mode | 4K | `--scale 1920x1080` | Frames decoded |
 |---|---|---|---|
-| nearest keyframe | 10.7–11.2 s (1,464 MiB) | 9.4 s (595 MiB) | 4,798 |
-| exact | 44.8 s (1,640 MiB) | 39.8 s (490 MiB) | 52,256 |
+| nearest keyframe | 10.7 s (1,464 MiB) | 5.2–5.3 s (595 MiB) | 4,798 |
+| exact | 42.2 s (1,640 MiB) | 36.6 s (490 MiB) | 52,256 |
 
-Scaled runs are faster because encoding 1080p frames is much cheaper than encoding 4K ones.
+Scaled runs are faster because encoding 1080p frames is much cheaper than encoding 4K ones. At 4K, nearest-keyframe runs are limited by the encoder.
 
 ## Scaling
 

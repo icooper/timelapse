@@ -3,13 +3,12 @@
 from fractions import Fraction
 
 import av
-import av.codec.hwaccel
 import pytest
-from videos import decode_indices, make_video
+from videos import decode_indices, make_video, read_index
 
 from timelapse.pipeline import Settings, make_plan, run_plan
-from timelapse.scale import GpuScaler, Size
-from timelapse.worker import FramePicker
+from timelapse.scale import AVBUFFERREF_DATA, GpuScaler, Size, _frames_context, _pointer
+from timelapse.worker import Decoder, FramePicker
 
 pytestmark = pytest.mark.gpu
 FPS = 20
@@ -21,7 +20,28 @@ def videos(tmp_path_factory):
     return {
         "gop20": make_video(folder / "gop20.mp4", seconds=60, fps=FPS, gop=20),
         "gop35": make_video(folder / "gop35.mp4", seconds=60, fps=FPS, gop=35),
+        "gop35_ipp": make_video(folder / "gop35_ipp.mp4", seconds=60, fps=FPS, gop=35, bframes=False),
     }
+
+
+@pytest.fixture
+def open_picker(gpu_device):
+    containers = []
+
+    def open_picker(path, **kwargs):
+        container = av.open(str(path))
+        containers.append(container)
+        stream = container.streams.video[0]
+        return FramePicker(container, stream, Decoder(stream, gpu_device), **kwargs)
+
+    yield open_picker
+    for container in containers:
+        container.close()
+
+
+def frames_context(frame) -> int:
+    """Address of the frame's AVHWFramesContext: the same for every frame from one pool."""
+    return _pointer(_frames_context(frame)[0] + AVBUFFERREF_DATA)
 
 
 def render(source, tmp_path, device, **settings):
@@ -63,6 +83,53 @@ def test_exact_mode_with_small_steps_decodes_forward(videos, tmp_path, gpu_devic
     assert sum(r.decoded for r in results) <= 30 * 19 + 35
 
 
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("keyframes", [nearest_multiple(100 * k, 35) for k in range(12)]),
+        ("exact", [100 * k for k in range(12)]),
+    ],
+)
+def test_video_without_b_frames(videos, tmp_path, gpu_device, mode, expected):
+    _, _, output = render(videos["gop35_ipp"], tmp_path, gpu_device, speedup=100, mode=mode)
+    assert decode_indices(output) == expected
+
+
+def test_decoder_keeps_its_pool_across_seeks(videos, open_picker):
+    # Flushing the decoder after each seek made it build a new pool of GPU frames,
+    # at about 4.5 ms per 4K seek. Without B-frames, it never needs a flush.
+    picker = open_picker(videos["gop35_ipp"], keyframes_only=True, seek_ahead=2)
+    times = (5, 20, 40, 55)
+    frames = [picker.pick(t) for t in times]  # kept alive so pool addresses aren't reused
+    assert [read_index(f) for f in frames] == [nearest_multiple(t * FPS, 35) for t in times]
+    assert len({frames_context(f) for f in frames}) == 1
+    assert picker.decoder.flushes == 0
+
+
+def test_exact_mode_reseeks_backward_without_stale_frames(videos, open_picker):
+    # Between frames, the next target can fall before the frame read ahead, so
+    # the picker seeks back. With B-frames, the decoder still holds later frames
+    # then, and it must flush rather than return one of them.
+    picker = open_picker(videos["gop35"], keyframes_only=False, seek_ahead=2)
+    assert [read_index(picker.pick(t)) for t in (5.0, 5.01, 5.02, 30.0)] == [100, 100, 100, 600]
+    assert picker.decoder.flushes == 1
+
+
+def test_decoder_drops_frames_held_from_before_a_seek(videos, gpu_device):
+    with av.open(str(videos["gop35"])) as container:
+        stream = container.streams.video[0]
+        decoder = Decoder(stream, gpu_device)
+        packets = container.demux(stream)
+        for _ in range(10):  # leaves frames held back for reordering
+            decoder.decode(next(packets))
+        container.seek(int(20 / stream.time_base), stream=stream)
+        decoder.seek()
+        packets = container.demux(stream)
+        indices = [read_index(f) for _ in range(10) for f in decoder.decode(next(packets))]
+    assert indices and min(indices) == 385  # the keyframe at or before 20 s
+    assert decoder.flushes == 0
+
+
 def test_chunks_join_seamlessly(videos, tmp_path, gpu_device):
     _, _, single = render(videos["gop35"], tmp_path, gpu_device, speedup=100, mode="exact", jobs_per_gpu=1)
     plan, _, chunked = render(
@@ -102,19 +169,21 @@ def test_scale_resizes_on_the_gpu(videos, tmp_path, gpu_device, video, mode, exp
     assert decode_indices(output) == expected
 
 
-def test_scaler_keeps_its_graph_across_seeks(videos, gpu_device):
-    # The decoder makes a new pool of GPU frames after every seek; rebuilding the
-    # filter graph for each one cost about 4 ms per frame.
+def test_scaler_keeps_its_graph_across_seeks(videos, open_picker):
+    # With B-frames, keyframe mode drains and then flushes the decoder, which makes
+    # a new pool of GPU frames for every pick; rebuilding the filter graph for
+    # each one cost about 4 ms per frame.
     scaler = GpuScaler(Size(320, 180))
-    decoder = av.codec.hwaccel.HWAccel("vaapi", gpu_device, allow_software_fallback=False, is_hw_owned=True)
-    with av.open(str(videos["gop20"]), hwaccel=decoder) as container:
-        picker = FramePicker(container, container.streams.video[0], keyframes_only=True, seek_ahead=2)
-        scaler(picker.pick(5))
-        graph = scaler._graph
-        for t in (20, 40, 10):
-            frame = scaler(picker.pick(t))
-            assert (frame.width, frame.height) == (320, 180)
-            assert scaler._graph is graph
+    picker = open_picker(videos["gop20"], keyframes_only=True, seek_ahead=2)
+    first = picker.pick(5)
+    scaler(first)
+    graph = scaler._graph
+    for t in (20, 40, 50):
+        source = picker.pick(t)
+        assert frames_context(source) != frames_context(first)
+        frame = scaler(source)
+        assert (frame.width, frame.height) == (320, 180)
+        assert scaler._graph is graph
 
 
 def test_scale_can_stretch(videos, tmp_path, gpu_device):
