@@ -1,12 +1,12 @@
 # timelapse
 
-Turn long videos into time-lapses on Intel Arc GPUs. A 24-hour 4K recording becomes a 300x time-lapse in about 11 seconds on two Arc Pro B70s, or about 9 seconds when scaled to 1080p.
+Turn long videos into time-lapses on Intel Arc GPUs. A 24-hour 4K recording becomes a 300x time-lapse in about 11 seconds on two Arc Pro B70s, or about 5 seconds when scaled to 1080p.
 
 For each output frame, it seeks to the right point in the source and decodes only the frames it needs on the GPU. Each frame goes straight to the GPU encoder without leaving GPU memory, and it can be resized on the GPU on the way. The timeline is split into chunks that run in parallel across all Intel GPUs, and the chunks are then joined without re-encoding.
 
 ## Usage
 
-Everything runs in a container, which provides an FFmpeg with VA-API and Intel's media driver:
+Everything runs in a container, which provides an FFmpeg with VA-API and Intel's media driver. That FFmpeg is built for this job alone: it reads H.264, HEVC and AV1 from MP4, MOV and MKV files, and writes the same three containers.
 
 ```bash
 docker compose build timelapse
@@ -24,6 +24,7 @@ By default the current folder is mounted at `/data`. Set `VIDEOS=/path/to/videos
 | `--speedup` | 300 | How many times faster than real time the output plays. A whole number, at least 2 |
 | `--fps` | input's rate | Output frame rate. It doesn't change the speedup, only the smoothness |
 | `--scale` | input's size | Output size as `WxH`, resized on the GPU. `-1` on one side keeps the aspect ratio, e.g. `1920x-1`. See [Scaling](#scaling) |
+| `-o`, `--output` | `<input>_<speedup>x.mp4` | Output file: `.mp4`, `.mov` or `.mkv`. MOV can't hold AV1. The folder must be writable, since the chunks are written there too |
 | `--codec` | `hevc` | `hevc` (tagged `hvc1` for Apple players), `h264` or `av1` |
 | `--quality` | 22 / 20 / 90 | CQP quality for hevc / h264 / av1; lower is better |
 | `--exact` / `--keyframes` | auto | How frames are picked; see below |
@@ -78,8 +79,9 @@ The GPU tests render synthetic videos whose frames have their frame number paint
 
 ### Why a container, and why `av==18.1.0`
 
-- **PyAV's PyPI wheels can't use these GPUs.** They bundle an FFmpeg built without VA-API, and on Linux FFmpeg's QSV support needs VA-API too. So the image compiles PyAV from source against Ubuntu 26.04's FFmpeg (`--no-binary-package av`).
-- **PyAV 19 requires FFmpeg 9**, while Ubuntu 26.04 ships FFmpeg 8.0, hence the pin. Move to av 19+ when the base image has FFmpeg 9, and re-check `scale.py`'s pinned offsets when you do (see [Scaling](#scaling)).
+- **PyAV's PyPI wheels can't use these GPUs.** They bundle an FFmpeg built without VA-API, and on Linux FFmpeg's QSV support needs VA-API too. So the image compiles PyAV from source (`--no-binary-package av`) against its own FFmpeg.
+- **The image builds FFmpeg 8.1 itself**, on Alpine 3.24, with only the decoders, encoders, filters and containers timelapse uses. Distribution builds link dozens of libraries for codecs, fonts and displays. Ubuntu 26.04's FFmpeg made the image 744 MB, and this build makes it 129 MB (48 MB compressed). To read another codec or container, add it to the `configure` flags in the Dockerfile's `ffmpeg` stage.
+- **PyAV 19 requires FFmpeg 9**, hence the pin. To move to av 19+, bump `FFMPEG_VERSION` and its checksum in the Dockerfile, and re-check `scale.py`'s pinned offsets (see [Scaling](#scaling)).
 
 ### Layout
 

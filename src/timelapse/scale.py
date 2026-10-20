@@ -25,7 +25,7 @@ POINTER = ctypes.sizeof(ctypes.c_void_p)
 # methods, then its C fields in declaration order (av/frame.pxd, av/filter/context.pxd).
 FRAME_PTR = object.__basicsize__ + POINTER  # Frame.ptr, an AVFrame *
 FILTER_CONTEXT_PTR = object.__basicsize__  # FilterContext.ptr, an AVFilterContext *
-# offsetof() in the FFmpeg 8.0 headers (libavutil 60, libavfilter 11). These are
+# offsetof() in the FFmpeg 8.0 and 8.1 headers (libavutil 60, libavfilter 11). These are
 # public structs, so they only change with a major version.
 AVFRAME_WIDTH, AVFRAME_HEIGHT, AVFRAME_FORMAT = 104, 108, 116
 AVFRAME_HW_FRAMES_CTX = 328
@@ -84,9 +84,10 @@ class GpuScaler:
 
     def __call__(self, frame: av.VideoFrame) -> av.VideoFrame:
         frames_ref, sw_format = _frames_context(frame)
-        # When the decoder is flushed, it replaces its pool of GPU frames. With
-        # B-frames, keyframe mode flushes it for every pick. A graph can take
-        # surfaces from any pool on the same device, so it's only rebuilt when
+        # Frames can come from different pools of GPU frames: FFmpeg 8.0 made a
+        # new one whenever the decoder was flushed, which keyframe mode does for
+        # every pick on streams with B-frames. A graph can take surfaces from
+        # any pool on the same device, so it's only rebuilt when
         # the frames' format or size changes.
         if self._graph is None or self._input != (sw_format, frame.width, frame.height):
             self._graph = self._build(frame, frames_ref)

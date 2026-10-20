@@ -50,4 +50,7 @@ def decode_indices(path: Path, device: str | None = None) -> list[int]:
     """Indices of every frame in `path`, decoding on `device` if given (needed for AV1 here)."""
     hwaccel = av.codec.hwaccel.HWAccel("vaapi", device) if device else None
     with av.open(str(path), hwaccel=hwaccel) as container:
+        if hwaccel:
+            # As in worker.Decoder: with pix_fmt preset to "vaapi", the AV1 decoder skips get_format().
+            container.streams.video[0].codec_context.pix_fmt = "yuv420p"
         return [read_index(frame) for frame in container.decode(video=0)]

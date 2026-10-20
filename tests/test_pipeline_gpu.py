@@ -96,8 +96,8 @@ def test_video_without_b_frames(videos, tmp_path, gpu_device, mode, expected):
 
 
 def test_decoder_keeps_its_pool_across_seeks(videos, open_picker):
-    # Flushing the decoder after each seek made it build a new pool of GPU frames,
-    # at about 4.5 ms per 4K seek. Without B-frames, it never needs a flush.
+    # On FFmpeg 8.0, flushing the decoder after each seek made it build a new pool
+    # of GPU frames, at about 4.5 ms per 4K seek. Without B-frames, it never needs a flush.
     picker = open_picker(videos["gop35_ipp"], keyframes_only=True, seek_ahead=2)
     times = (5, 20, 40, 55)
     frames = [picker.pick(t) for t in times]  # kept alive so pool addresses aren't reused
@@ -169,15 +169,16 @@ def test_scale_resizes_on_the_gpu(videos, tmp_path, gpu_device, video, mode, exp
     assert decode_indices(output) == expected
 
 
-def test_scaler_keeps_its_graph_across_seeks(videos, open_picker):
-    # With B-frames, keyframe mode drains and then flushes the decoder, which makes
-    # a new pool of GPU frames for every pick; rebuilding the filter graph for
-    # each one cost about 4 ms per frame.
+def test_scaler_keeps_its_graph_across_pools(videos, open_picker):
+    # FFmpeg 8.0 made a new pool of GPU frames on every flush, which keyframe mode
+    # does for every pick with B-frames; rebuilding the filter graph for each pool
+    # cost about 4 ms per frame. FFmpeg 8.1 keeps the pool, so frames from a second
+    # decoder stand in for a new one.
     scaler = GpuScaler(Size(320, 180))
-    picker = open_picker(videos["gop20"], keyframes_only=True, seek_ahead=2)
-    first = picker.pick(5)
+    first = open_picker(videos["gop20"], keyframes_only=True, seek_ahead=2).pick(5)
     scaler(first)
     graph = scaler._graph
+    picker = open_picker(videos["gop20"], keyframes_only=True, seek_ahead=2)
     for t in (20, 40, 50):
         source = picker.pick(t)
         assert frames_context(source) != frames_context(first)
@@ -198,3 +199,21 @@ def test_scale_can_stretch(videos, tmp_path, gpu_device):
 def test_other_codecs(videos, tmp_path, gpu_device, codec):
     _, _, output = render(videos["gop20"], tmp_path, gpu_device, speedup=100, codec=codec)
     assert decode_indices(output, gpu_device) == [100 * k for k in range(12)]
+
+
+def test_av1_input(videos, tmp_path, gpu_device):
+    # Every other frame of gop20, with a keyframe every 2 s: too far apart for
+    # keyframe mode, so this decodes forward from them.
+    _, _, source = render(videos["gop20"], tmp_path, gpu_device, speedup=2, codec="av1")
+    plan, _, output = render(source, tmp_path, gpu_device, speedup=10)
+    assert not plan.keyframes_only
+    assert decode_indices(output) == [20 * k for k in range(60)]
+
+
+@pytest.mark.parametrize("suffix,format_name", [(".mov", "mov"), (".mkv", "matroska")])
+def test_other_containers(videos, tmp_path, gpu_device, suffix, format_name):
+    output = tmp_path / f"out{suffix}"
+    run_plan(make_plan(videos["gop20"], output, Settings(fps=Fraction(FPS), speedup=100), [gpu_device]))
+    with av.open(str(output)) as container:
+        assert format_name in container.format.name
+    assert decode_indices(output) == [100 * k for k in range(12)]

@@ -39,7 +39,8 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
 
 - **GPUs:** `/dev/dri/renderD128` and `renderD130` are the Arcs. `renderD129` is the AMD iGPU, so never use it. `discover_intel_gpus()` filters by vendor `0x8086`. The render group's GID is 991.
 - **Anything that touches the GPU must run in the container.** The host's `.venv` uses PyAV's PyPI wheel, whose bundled FFmpeg has no VA-API. QSV on Linux needs VA-API too.
-- **PyAV is pinned to `av==18.1.0`.** The image builds it from source (`--no-binary-package av`) against Ubuntu 26.04's FFmpeg 8.0. av 19 needs FFmpeg 9.
+- **The image is Alpine 3.24 (musl) with its own FFmpeg 8.1.3**, built in the Dockerfile's `ffmpeg` stage with only the components timelapse uses. See Build below.
+- **PyAV is pinned to `av==18.1.0`.** The image builds it from source (`--no-binary-package av`) against that FFmpeg. av 19 needs FFmpeg 9.
 - **Videos** (`*.mp4`, gitignored) sit in the repo root and belong to the user. Never modify, move or delete them. They get renamed and deleted often, so run `ls` before relying on one.
 
 ## Benchmarks
@@ -54,6 +55,7 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
 - **Update that table** whenever performance changes.
 - **Per-stage timing:** wrap `FramePicker.pick` and `GpuScaler.__call__` in a script that calls `render_chunk` directly.
 - **Comparing implementations:** the CLI's 🎉 line times the render. Hash the outputs too. The decoder changes so far left them byte-identical.
+  - Across FFmpeg builds, hash the video packets, not the file. The MP4's `encoder` tag carries libavformat's version. The move from Ubuntu's FFmpeg 8.0 to our 8.1.3 left the packets identical.
 
 ## Invariants and gotchas
 
@@ -63,18 +65,19 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
   - The encoder gets `pix_fmt = "vaapi"` and its own `HWAccel`, then adopts the first frame's frames context.
   - Keep `reformat()` and `to_ndarray()` out of the hot path. Copying one 4K frame out of the GPU costs about 6.5 ms.
 - **Set `frame.pict_type = PictureType.NONE` before encoding.** Decoded keyframes keep type I, which forces IDR frames. Without the reset, every output frame was an I-frame and the file was 1.7x larger.
-- **A flushed H.264 decoder makes a new frames context (pool of GPU frames).** FFmpeg rebuilds the hwaccel on the next frame, at about 4.5 ms per 4K seek.
+- **On FFmpeg 8.0, a flushed H.264 decoder made a new frames context (pool of GPU frames).** FFmpeg rebuilt the hwaccel on the next frame, at about 4.5 ms per 4K seek. FFmpeg 8.1 keeps the pool across flushes, with or without B-frames.
   - `container.seek()` flushes every stream's own decoder. So the worker decodes with its own `Decoder`, which seeks don't touch.
   - `Decoder` flushes only after draining, or before going back to a packet it has already decoded. It drops frames held from before a seek.
+- **Set the decoder's `pix_fmt` to a software format before the first packet.** With `hwaccel=`, PyAV presets it to `vaapi`. FFmpeg's `av1` decoder takes that as an hwaccel already set up, skips `get_format()`, and fails with "get_buffer() failed" (`avcodec_send_packet()` returns 22). `Decoder` and the tests' `decode_indices()` both reset it. H.264 and HEVC aren't affected.
 - **Streams with B-frames** hold an isolated keyframe back for reordering, and `low_delay` doesn't help.
-  - Keyframe mode drains them with `decode(None)`, so the next pick flushes, and their pools still change with every pick. Drained frames have no `time_base`.
+  - Keyframe mode drains them with `decode(None)`, so the next pick flushes. Drained frames have no `time_base`.
   - The cameras have no B-frames. The synthetic test videos have them, except `gop35_ipp`.
 - **Frames contexts:**
   - Never key a cache on a frames-context pointer. `GpuScaler` used to, and rebuilt its graph for every frame, at about 4 ms each.
   - When counting pools, keep the frames alive, or freed addresses get reused and you undercount. Compare the `AVHWFramesContext` address, as `frames_context()` in the GPU tests does. The frame's `hw_frames_ctx` reference differs for every frame.
 - **`hevc_vaapi` uses B-frames**, so pts ≠ dts. The worker checks that timestamps stay valid.
   - Segments must be MP4: NUT loses dts on demux.
-  - `concat` needs `add_stream_from_template(stream, opaque=True)`. Without `opaque`, PyAV looks up an encoder by the decoder's name, such as `libdav1d`, and fails.
+  - `concat` needs `add_stream_from_template(stream, opaque=True)`. Without `opaque`, PyAV looks up an encoder by the decoder's name, such as `av1`, and fails.
 
 **`scale.py` (the ctypes bridge)**
 - PyAV 18 can't give a filter graph's buffer source a hardware frames context. So `scale.py` calls `av_buffersrc_parameters_set` through ctypes, on the libavfilter PyAV already loaded.
@@ -82,7 +85,7 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
   - the Cython object layouts of PyAV 18.1;
   - the FFmpeg 8 struct offsets for libavutil 60 and libavfilter 11.
 - **`unsupported_reason()` refuses other versions.**
-- **On an upgrade, recompute the offsets.** Compile a small C program against the image's headers that prints `offsetof` for:
+- **On an upgrade, recompute the offsets.** Compile a small C program in the `build` stage, against the headers in `/usr/local/include`, that prints `offsetof` for:
   - `AVFrame` width, height, format and hw_frames_ctx;
   - `AVHWFramesContext` format and sw_format;
   - `AVBufferSrcParameters` format and hw_frames_ctx;
@@ -111,23 +114,33 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
     | 6 | 10.7 s | 4.8 s | 44.4 s | 38.5 s |
 
 **Build**
+- **FFmpeg is built with `--disable-everything`,** then each component is enabled by name. Anything missing fails at runtime, often with an unhelpful error. The list of what's enabled is in the build log's configure summary (`docker build --progress=plain`).
+  - Enabled for tests or helpers, not renders: `libx264` for `make_video()`, and the NUT muxer for `check_device()`.
+  - The output muxers must match `OUTPUT_FORMATS` in `concat.py`, which the CLI checks `-o` against. `UNSUPPORTED_CODECS` lists the codecs a container can't hold (AV1 in MOV).
+  - `buffer` and `buffersink` are always built, so the summary lists only `scale_vaapi` under filters.
+  - It builds in about 20 s. PyAV rebuilds whenever the `ffmpeg` stage changes, which takes about 80 s.
+- **Bumping `FFMPEG_VERSION`:** check the tarball's `.asc` signature against FFmpeg's release key (`FCF986EA15E6E293A5644F10B4322F04D67658D8`), update the `ADD --checksum`, and recompute the `scale.py` offsets.
+- **Keep `--refresh-package av` and the `uv-alpine` cache id.** uv tags the PyAV wheel it builds `linux_x86_64`, whatever libc or FFmpeg it was built against, and reuses it from the cache. A glibc wheel left over from the Ubuntu image once got installed on Alpine. PyAV then fell back to its uncompiled `.py` sources and failed with `No module named 'cython'`.
+- **Keep the `strip` after the PyAV build.** Alpine's Python compiles extensions with `-g`, and stripping saves 25 MB.
 - **Keep `--reinstall-package timelapse` in the Dockerfile.** uv decides whether to rebuild the project from `pyproject.toml`'s mtime, so without it the cache mount can serve a stale wheel. This once made the tests run old code.
 - **`.dockerignore` is an allowlist** that keeps the 40 GB of videos out of the build context. Add any new top-level file the image needs.
 
 ## Tests
 
 - **`tests/videos.py`** paints each frame's index into its luma. `decode_indices()` reads the indices back, so tests check exactly which source frame was picked.
-  - AV1 outputs need `decode_indices(path, gpu_device)`.
+  - AV1 outputs need `decode_indices(path, gpu_device)`: the image has no software AV1 decoder.
   - `make_video(..., bframes=False)` gives a stream like the cameras', which takes `Decoder`'s no-flush path. The B-frame videos cover draining and the flushes.
 - **GPU tests** are marked `gpu`. The `gpu_device` fixture skips them unless VA-API encoding works.
   - Any change to `worker.py`, `scale.py` or `concat.py` needs a GPU test.
   - Pure logic gets a host test.
-- **Warnings raised in worker processes don't reach pytest.** To catch deprecations, run the code in the test process, as `test_scaler_keeps_its_graph_across_seeks` does, together with `-W error::DeprecationWarning`.
+- **Warnings raised in worker processes don't reach pytest.** To catch deprecations, run the code in the test process, as `test_scaler_keeps_its_graph_across_pools` does, together with `-W error::DeprecationWarning`.
 
 ## Conventions
 
 - **Ruff:** line length 110, rules `E F I UP B`, target py314. `except ValueError, ZeroDivisionError:` without parentheses is valid 3.14 syntax, so leave it.
 - **Errors:** the user sees `TimelapseError`, which the CLI prints as `❌ …` before exiting with code 1. Invalid arguments use `typer.BadParameter`.
+  - The maintainer wants a clean, informative message for every failure the user can cause, never a traceback. Say what's wrong and what to do instead.
+  - Check what you can before rendering starts. A bad output used to fail only in `concat`, after the whole render. The CLI now checks the output's extension, its codec and its folder up front.
 - **CLI output** is one line per fact, each starting with an emoji: 🎥 🔑 📐 🧩 ⚠️ 🎉 ❌.
 - **Comments** explain why, usually an FFmpeg or PyAV quirk, not what. Match the existing density.
 
@@ -139,4 +152,5 @@ docker run --rm --device /dev/dri --group-add 991 -u 1000:1000 \
 
 ## Known opportunities
 
-- **Moving to PyAV 19+ and FFmpeg 9:** wait until the base image ships FFmpeg 9, then redo `scale.py`'s offsets. Check upstream too: PyAV main's `Graph` now accepts a `hw_device`, and it may grow buffer-source frames-context support, which would replace the ctypes bridge.
+- **Moving to PyAV 19+ and FFmpeg 9:** bump `FFMPEG_VERSION` (see Build), then redo `scale.py`'s offsets. Check upstream too: PyAV main's `Graph` now accepts a `hw_device`, and it may grow buffer-source frames-context support, which would replace the ctypes bridge.
+- **`Decoder` may no longer be needed.** It avoids the pool rebuild that flushes caused on FFmpeg 8.0, and 8.1 no longer rebuilds the pool. Benchmark decoding through the container's own decoder before removing it: flushes may still cost something.

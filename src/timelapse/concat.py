@@ -7,12 +7,18 @@ from pathlib import Path
 
 import av
 
+# Output containers by file extension. The image's FFmpeg has only these muxers.
+OUTPUT_FORMATS = {".mp4": "mp4", ".mov": "mov", ".mkv": "matroska"}
+# FFmpeg's MOV muxer has no tag for AV1.
+UNSUPPORTED_CODECS = {".mov": {"av1"}}
+
 
 def concat_segments(segments: list[Path], output: Path, fps: Fraction, codec: str) -> int:
     """Remux the segments back to back into `output`. Returns the number of frames written."""
     frame_time = 1 / Fraction(fps)
     total = 0
-    with av.open(str(output), "w", container_options={"movflags": "+faststart"}) as out:
+    muxer = OUTPUT_FORMATS[output.suffix.lower()]
+    with av.open(str(output), "w", format=muxer, container_options={"movflags": "+faststart"}) as out:
         out_stream = None
         for path in segments:
             with av.open(str(path)) as segment:

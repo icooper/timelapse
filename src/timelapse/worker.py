@@ -56,11 +56,11 @@ class ChunkResult:
 class Decoder:
     """Decodes a stream on the GPU, without the reinitialization a flush causes.
 
-    container.seek() flushes the stream's own decoder, and after a flush FFmpeg's
-    H.264 decoder rebuilds its hwaccel, with a new pool of GPU frames. At 4K that
-    cost about 4.5 ms per seek. Seeks don't touch this decoder, so it's flushed
-    only when it has to be: after draining, or before going back to a packet it
-    has already decoded.
+    container.seek() flushes the stream's own decoder, and after a flush FFmpeg
+    8.0's H.264 decoder rebuilt its hwaccel, with a new pool of GPU frames. At 4K
+    that cost about 4.5 ms per seek. (FFmpeg 8.1 keeps the pool.) Seeks don't
+    touch this decoder, so it's flushed only when it has to be: after draining,
+    or before going back to a packet it has already decoded.
     """
 
     def __init__(self, stream, device: str):
@@ -70,6 +70,11 @@ class Decoder:
         if not self.context.is_hwaccel:
             raise RuntimeError(f"{stream.codec_context.name} can't be decoded on {device}")
         self.context.extradata = stream.codec_context.extradata
+        # PyAV presets pix_fmt to "vaapi". FFmpeg's AV1 decoder takes that to mean
+        # its hwaccel is already set up, skips get_format() and can't allocate
+        # frames. A software format makes it negotiate the hwaccel.
+        if sw_format := stream.codec_context.pix_fmt:
+            self.context.pix_fmt = sw_format
         self.flushes = 0
         self._start: int | None = None  # pts of the first packet since the last seek
         self._last: int | None = None  # highest pts decoded since the last flush

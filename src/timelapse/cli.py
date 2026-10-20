@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from enum import StrEnum
 from fractions import Fraction
@@ -21,6 +22,7 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
+from timelapse.concat import OUTPUT_FORMATS, UNSUPPORTED_CODECS
 from timelapse.errors import TimelapseError
 from timelapse.gpu import ENCODERS, check_device, discover_intel_gpus
 from timelapse.pipeline import Plan, Settings, make_plan, run_plan
@@ -58,6 +60,41 @@ def parse_size(text: str) -> Size:
 
 def default_output(source: Path, speedup: int) -> Path:
     return source.with_name(f"{source.stem}_{speedup}x.mp4")
+
+
+def check_output_name(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    if path.is_dir():
+        raise typer.BadParameter(f"{path} is a folder; name the output file, e.g. {path / 'timelapse.mp4'}")
+    if path.suffix.lower() not in OUTPUT_FORMATS:
+        kind = f"{path.suffix} files" if path.suffix else "files without an extension"
+        raise typer.BadParameter(f"can't write {kind}; use {either(OUTPUT_FORMATS)}")
+    return path
+
+
+def check_output_codec(output: Path, codec: str) -> None:
+    if codec in UNSUPPORTED_CODECS.get(output.suffix.lower(), ()):
+        fits = [suffix for suffix in OUTPUT_FORMATS if codec not in UNSUPPORTED_CODECS.get(suffix, ())]
+        raise typer.BadParameter(f"{output.suffix} files can't hold {codec}; use {either(fits)}")
+
+
+def either(choices) -> str:
+    *others, last = choices
+    return f"{', '.join(others)} or {last}" if others else last
+
+
+def check_writable(output: Path) -> None:
+    """Fail before rendering, not after: segments and the output go in the output's folder."""
+    folder = output.resolve().parent
+    if not folder.exists():
+        raise TimelapseError(f"can't write to {folder}: it doesn't exist")
+    if not folder.is_dir():
+        raise TimelapseError(f"can't write to {folder}: it isn't a folder")
+    if not os.access(folder, os.W_OK):
+        if os.statvfs(folder).f_flag & os.ST_RDONLY:
+            raise TimelapseError(f"can't write to {folder}: it's read-only (in Docker, mount it without :ro)")
+        raise TimelapseError(f"can't write to {folder}: this user doesn't have permission")
 
 
 class RateColumn(ProgressColumn):
@@ -146,7 +183,13 @@ def timelapse(
         list[Path], typer.Argument(exists=True, dir_okay=False, help="Video files to speed up.")
     ],
     output: Annotated[
-        Path | None, typer.Option("--output", "-o", help="Output file (default: <input>_<speedup>x.mp4).")
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            callback=check_output_name,
+            help="Output file: .mp4, .mov or .mkv (default: <input>_<speedup>x.mp4).",
+        ),
     ] = None,
     speedup: Annotated[int, typer.Option(min=2, help="How many times faster than real time.")] = 300,
     fps: Annotated[
@@ -194,7 +237,12 @@ def timelapse(
         start=start,
         end=end,
     )
+    outputs = [output or default_output(source, speedup) for source in inputs]
+    for target in outputs:
+        check_output_codec(target, settings.codec)
     try:
+        for target in outputs:
+            check_writable(target)
         devices = device or discover_intel_gpus()
         if not devices:
             raise TimelapseError("no Intel GPU render nodes found; pass --device or check /dev/dri")
@@ -204,8 +252,8 @@ def timelapse(
                     raise TimelapseError(f"{d} can't encode with {ENCODERS[settings.codec]}: {error}")
             if scale and (reason := unsupported_reason()):
                 raise TimelapseError(f"--scale: {reason}")
-        for source in inputs:
-            plan = make_plan(source, output or default_output(source, speedup), settings, devices)
+        for source, target in zip(inputs, outputs, strict=True):
+            plan = make_plan(source, target, settings, devices)
             describe(plan)
             if dry_run:
                 show_chunks(plan)

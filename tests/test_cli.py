@@ -1,3 +1,4 @@
+import os
 from fractions import Fraction
 from pathlib import Path
 
@@ -76,6 +77,11 @@ def test_dry_run_shows_plan_without_touching_the_gpu(clip):
     assert "4 chunks" in result.output
 
 
+def flat(output: str) -> str:
+    """CLI output without Rich's error box and line wrapping."""
+    return " ".join(output.replace("│", " ").split())
+
+
 def dry_run(clip, *args: str):
     return CliRunner().invoke(app, [str(clip), *args, "--device", "/dev/dri/renderD128", "--dry-run"])
 
@@ -104,3 +110,53 @@ def test_dry_run_warns_when_scaling_stretches(clip):
 def test_output_with_several_inputs_is_rejected(clip):
     result = CliRunner().invoke(app, [str(clip), str(clip), "-o", "out.mp4", "--dry-run"])
     assert result.exit_code != 0
+
+
+@pytest.mark.parametrize("name", ["out.mp4", "out.mov", "out.mkv", "out.MP4"])
+def test_output_containers_are_accepted(clip, tmp_path, name):
+    result = dry_run(clip, "-o", str(tmp_path / name))
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    "name,message",
+    [("out.webm", "can't write .webm files"), ("out", "can't write files without an extension")],
+)
+def test_output_needs_a_supported_extension(clip, tmp_path, name, message):
+    result = dry_run(clip, "-o", str(tmp_path / name))
+    assert result.exit_code == 2, result.output
+    assert f"{message}; use .mp4, .mov or .mkv" in flat(result.output)
+
+
+def test_output_folder_is_rejected(clip, tmp_path):
+    result = dry_run(clip, "-o", str(tmp_path))
+    assert result.exit_code == 2, result.output
+    assert "is a folder; name the output file" in flat(result.output)
+
+
+def test_output_folder_must_exist(clip, tmp_path):
+    result = dry_run(clip, "-o", str(tmp_path / "missing" / "out.mp4"))
+    assert result.exit_code == 1, result.output
+    assert "missing: it doesn't exist" in flat(result.output)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anywhere")
+def test_output_folder_must_be_writable(clip, tmp_path):
+    folder = tmp_path / "locked"
+    folder.mkdir(mode=0o555)
+    result = dry_run(clip, "-o", str(folder / "out.mp4"))
+    assert result.exit_code == 1, result.output
+    assert "locked: this user doesn't have permission" in flat(result.output)
+
+
+def test_output_folder_must_be_a_folder(clip, tmp_path):
+    (tmp_path / "file").touch()
+    result = dry_run(clip, "-o", str(tmp_path / "file" / "out.mp4"))
+    assert result.exit_code == 1, result.output
+    assert "file: it isn't a folder" in flat(result.output)
+
+
+def test_mov_output_rejects_av1(clip, tmp_path):
+    result = dry_run(clip, "--codec", "av1", "-o", str(tmp_path / "out.mov"))
+    assert result.exit_code == 2, result.output
+    assert ".mov files can't hold av1; use .mp4 or .mkv" in flat(result.output)
